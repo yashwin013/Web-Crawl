@@ -68,12 +68,25 @@ def parse_robots_txt(base_url: str, user_agent: str = "*") -> RobotsRules:
         except Exception:
             pass
         
+        # Check if parser actually loaded rules (has content)
+        # If robots.txt has no User-agent rules, allow everything
+        if not hasattr(parser, 'entries') or not parser.entries:
+            logger.info(f"No robot rules found in {robots_url}, allowing all")
+            permissive_parser = RobotFileParser()
+            permissive_parser.set_url(robots_url)
+            # Create a permissive robots.txt that allows everything
+            permissive_parser.parse(["User-agent: *", "Allow: /"])
+            return RobotsRules(parser=permissive_parser, crawl_delay=crawl_delay)
+        
         return RobotsRules(parser=parser, crawl_delay=crawl_delay)
         
     except Exception as e:
         logger.warning(f"Failed to parse robots.txt at {robots_url}: {e}")
-        # Return permissive rules on failure
-        return RobotsRules(parser=RobotFileParser(), crawl_delay=0.0)
+        # Return permissive rules on failure - allow everything
+        permissive_parser = RobotFileParser()
+        permissive_parser.set_url(robots_url)
+        permissive_parser.parse(["User-agent: *", "Allow: /"])
+        return RobotsRules(parser=permissive_parser, crawl_delay=0.0)
 
 
 def parse_sitemap(base_url: str, timeout: int = 30) -> Set[str]:

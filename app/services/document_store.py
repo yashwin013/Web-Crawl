@@ -11,7 +11,7 @@ from pymongo.collection import Collection
 from pymongo.database import Database
 
 from app.config import get_logger
-from app.schemas.document import CrawledDocument, DocumentStatus
+from app.schemas.document import CrawledDocument, DocumentStatus, WebsiteCrawl, VisitedUrl, PdfDocument
 
 logger = get_logger(__name__)
 
@@ -65,6 +65,17 @@ class DocumentStore:
             self._collection = self._db["documents"]
             self._ensure_indexes()
         return self._collection
+    
+    def _get_websites_collection(self) -> Collection:
+        """Get the websites collection for nested structure."""
+        client = self._get_client()
+        if self._db is None:
+            self._db = client[self._database_name]
+        websites_collection = self._db["websites"]
+        # Ensure indexes for websites collection
+        websites_collection.create_index([("websiteUrl", ASCENDING), ("crawlSessionId", ASCENDING)], unique=True)
+        websites_collection.create_index([("crawlSessionId", ASCENDING)])
+        return websites_collection
     
     def _ensure_indexes(self) -> None:
         """Create indexes for efficient queries."""
@@ -167,6 +178,34 @@ class DocumentStore:
         ).sort("createdAt", ASCENDING)
         
         return [CrawledDocument.from_mongo_dict(doc) for doc in cursor]
+    
+    def update_document(self, file_id: str, update_data: dict) -> bool:
+        """
+        Update document with arbitrary fields.
+        
+        Args:
+            file_id: Document file ID
+            update_data: Dictionary of fields to update
+            
+        Returns:
+            True if updated, False if not found
+        """
+        collection = self._get_collection()
+        
+        # Always update the updatedAt timestamp
+        update_data["updatedAt"] = datetime.utcnow()
+        
+        result = collection.update_one(
+            {"fileId": file_id},
+            {"$set": update_data}
+        )
+        
+        if result.modified_count > 0:
+            logger.debug(f"Updated document {file_id} with {len(update_data)} fields")
+            return True
+        
+        logger.warning(f"Document {file_id} not found for update")
+        return False
     
     def update_status(
         self,
@@ -282,6 +321,176 @@ class DocumentStore:
             "stored": 0,
             "total_vectors": 0,
         }
+    # ============== Nested Website Structure Methods ==============
+    
+    def create_or_get_website(
+        self,
+        website_url: str,
+        crawl_session_id: str
+    ) -> WebsiteCrawl:
+        """
+        Create a new website document or get existing one.
+        
+        Args:
+            website_url: Base URL of the website
+            crawl_session_id: Session ID for this crawl
+            
+        Returns:
+            WebsiteCrawl document
+        """
+        collection = self._get_websites_collection()
+        
+        # Try to find existing document
+        result = collection.find_one({
+            "websiteUrl": website_url,
+            "crawlSessionId": crawl_session_id
+        })
+        
+        if result:
+            return WebsiteCrawl.from_mongo_dict(result)
+        
+        # Create new document
+        website = WebsiteCrawl(
+            website_url=website_url,
+            crawl_session_id=crawl_session_id
+        )
+        
+        mongo_doc = website.to_mongo_dict()
+        collection.insert_one(mongo_doc)
+        
+        logger.info(f"Created website crawl: {website_url} (session={crawl_session_id})")
+        return website
+    
+    def add_pdf_to_website(
+        self,
+        website_url: str,
+        crawl_session_id: str,
+        visited_url: str,
+        crawl_depth: int,
+        pdf_document: PdfDocument
+    ) -> bool:
+        """
+        Add a PDF to a visited URL within a website.
+        Creates the website and visited URL if they don't exist.
+        
+        Args:
+            website_url: Base URL of the website
+            crawl_session_id: Session ID for this crawl
+            visited_url: The URL where the PDF was found
+            crawl_depth: Depth in crawl tree
+            pdf_document: The PDF document to add
+            
+        Returns:
+            True if added, False on error
+        """
+        collection = self._get_websites_collection()
+        
+        # Check if this URL already has this PDF
+        existing = collection.find_one({
+            "websiteUrl": website_url,
+            "crawlSessionId": crawl_session_id,
+            "visitedUrls.url": visited_url,
+            "visitedUrls.pdfs.fileId": pdf_document.file_id
+        })
+        
+        if existing:
+            logger.warning(f"PDF {pdf_document.file_id} already exists in {visited_url}")
+            return False
+        
+        # Check if the visited URL exists
+        existing_url = collection.find_one({
+            "websiteUrl": website_url,
+            "crawlSessionId": crawl_session_id,
+            "visitedUrls.url": visited_url
+        })
+        
+        if existing_url:
+            # Add PDF to existing URL
+            result = collection.update_one(
+                {
+                    "websiteUrl": website_url,
+                    "crawlSessionId": crawl_session_id,
+                    "visitedUrls.url": visited_url
+                },
+                {
+                    "$push": {"visitedUrls.$.pdfs": pdf_document.to_mongo_dict()},
+                    "$set": {"updatedAt": datetime.utcnow()}
+                }
+            )
+        else:
+            # Create new visited URL with the PDF
+            visited_url_obj = VisitedUrl(
+                url=visited_url,
+                crawl_depth=crawl_depth,
+                pdfs=[pdf_document]
+            )
+            
+            # Check if website exists
+            website_exists = collection.find_one({
+                "websiteUrl": website_url,
+                "crawlSessionId": crawl_session_id
+            })
+            
+            if website_exists:
+                # Add visited URL to existing website
+                result = collection.update_one(
+                    {
+                        "websiteUrl": website_url,
+                        "crawlSessionId": crawl_session_id
+                    },
+                    {
+                        "$push": {"visitedUrls": visited_url_obj.to_mongo_dict()},
+                        "$set": {"updatedAt": datetime.utcnow()}
+                    }
+                )
+            else:
+                # Create new website with visited URL
+                website = WebsiteCrawl(
+                    website_url=website_url,
+                    crawl_session_id=crawl_session_id,
+                    visited_urls=[visited_url_obj]
+                )
+                collection.insert_one(website.to_mongo_dict())
+                result = type('obj', (object,), {'modified_count': 1})()
+        
+        if result.modified_count > 0 or not existing_url:
+            logger.info(f"Added PDF {pdf_document.file_id} to {visited_url}")
+            return True
+        
+        return False
+    
+    def get_website_by_session(self, crawl_session_id: str) -> List[WebsiteCrawl]:
+        """Get all websites from a crawl session."""
+        collection = self._get_websites_collection()
+        cursor = collection.find({"crawlSessionId": crawl_session_id})
+        return [WebsiteCrawl.from_mongo_dict(doc) for doc in cursor]
+    
+    def get_website(self, website_url: str, crawl_session_id: str) -> Optional[WebsiteCrawl]:
+        """Get a specific website crawl."""
+        collection = self._get_websites_collection()
+        result = collection.find_one({
+            "websiteUrl": website_url,
+            "crawlSessionId": crawl_session_id
+        })
+        if result:
+            return WebsiteCrawl.from_mongo_dict(result)
+        return None
+    
+    def get_all_pdfs_from_website(
+        self,
+        website_url: str,
+        crawl_session_id: str
+    ) -> List[PdfDocument]:
+        """Get all PDFs from a website across all visited URLs."""
+        website = self.get_website(website_url, crawl_session_id)
+        if not website:
+            return []
+        
+        pdfs = []
+        for visited_url in website.visited_urls:
+            pdfs.extend(visited_url.pdfs)
+        return pdfs
+    
         
         for r in results:
             status = r["_id"]

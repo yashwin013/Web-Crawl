@@ -104,14 +104,21 @@ class CrawlerStage(PipelineStage):
         base_domain = self._get_base_domain(start_url)
         document.start_time = time.time()
         
+        # Set crawl session ID for this crawl
+        self._crawl_session_id = str(uuid.uuid4())
+        logger.info(f"Starting crawl session: {self._crawl_session_id}")
+        
         # Parse robots.txt
         if crawl_config and crawl_config.respect_robots:
+            logger.info(f"Respecting robots.txt for {base_domain}")
             self._robots = parse_robots_txt(start_url)
             if self._robots.crawl_delay > 0:
                 self._rate_limiter.base_delay = max(
                     self._rate_limiter.base_delay,
                     self._robots.crawl_delay
                 )
+        else:
+            logger.info(f"Ignoring robots.txt for {base_domain} (respect_robots=False)")
         
         # Discover URLs from sitemap
         discovered_urls: Set[str] = set()
@@ -126,8 +133,10 @@ class CrawlerStage(PipelineStage):
             if self._is_same_domain(url, base_domain):
                 await queue.put((url, 1))
         
+        logger.info(f"Crawl queue initialized with {queue.qsize()} URLs (start_url + {len(discovered_urls)} from sitemap)")
+        
         visited: Set[str] = set()
-        pdf_urls: Set[str] = set()
+        pdf_mapping: dict = {}  # Maps pdf_url -> (referring_page_url, depth)
         
         # Lazy import playwright
         from playwright.async_api import async_playwright
@@ -141,8 +150,11 @@ class CrawlerStage(PipelineStage):
             while not queue.empty() and len(visited) < max_pages:
                 url, depth = await queue.get()
                 
+                logger.info(f"Processing URL from queue: {url} (depth={depth})")
+                
                 # Skip if already visited
                 if url in visited:
+                    logger.info(f"Already visited, skipping: {url}")
                     continue
                 
                 # Normalize URL
@@ -151,13 +163,13 @@ class CrawlerStage(PipelineStage):
                 # Check content filter
                 should_skip, reason = self._content_filter.should_skip_url(url)
                 if should_skip:
-                    logger.debug(f"Skipping {url}: {reason}")
+                    logger.info(f"Skipping {url}: {reason}")
                     document.pages_skipped += 1
                     continue
                 
                 # Check robots.txt
                 if self._robots and not self._robots.can_fetch(url):
-                    logger.debug(f"Blocked by robots.txt: {url}")
+                    logger.info(f"Blocked by robots.txt: {url}")
                     document.pages_skipped += 1
                     continue
                 
@@ -165,36 +177,48 @@ class CrawlerStage(PipelineStage):
                 
                 # Handle PDFs separately
                 if self._is_pdf(url):
-                    pdf_urls.add(url)
+                    # Store PDF with None as referring page (directly visited)
+                    if url not in pdf_mapping:
+                        pdf_mapping[url] = (None, depth)
                     continue
                 
                 # Rate limit
                 await self._rate_limiter.wait()
                 
                 try:
+                    logger.info(f"Attempting to crawl: {url}")
                     page = await self._crawl_single_page(url, depth, output_dir)
                     document.add_page(page)
                     self._rate_limiter.success()
+                    logger.info(f"Successfully crawled: {url} (found {len(page.html_content) if page.html_content else 0} chars)")
                     
                     # Extract links for further crawling
                     if depth < max_depth and page.html_content:
                         links = await self._extract_links_from_html(
                             page.html_content, url, base_domain
                         )
+                        logger.info(f"Found {len(links)} links on {url}")
                         for link in links:
                             if link not in visited:
-                                await queue.put((link, depth + 1))
+                                # Check if link is a PDF and track the referring page
+                                if self._is_pdf(link):
+                                    if link not in pdf_mapping:
+                                        pdf_mapping[link] = (url, depth + 1)  # Store referring page
+                                else:
+                                    await queue.put((link, depth + 1))
                                 
                 except Exception as e:
-                    logger.error(f"Failed to crawl {url}: {e}")
+                    logger.error(f"Failed to crawl {url}: {e}", exc_info=True)
                     self._rate_limiter.failure()
                     document.pages_failed += 1
             
-            # Download PDFs
-            for pdf_url in pdf_urls:
+            # Download PDFs with their referring pages
+            for pdf_url, (referring_page, depth) in pdf_mapping.items():
                 try:
-                    pdf_page = await self._download_pdf(pdf_url, output_dir)
+                    # Pass the referring page URL so PDF is nested under that page in MongoDB
+                    pdf_page = await self._download_pdf(pdf_url, output_dir, current_page_url=referring_page, crawl_depth=depth)
                     document.add_page(pdf_page)
+                    logger.info(f"Downloaded PDF from page: {referring_page or 'direct'} -> {pdf_url}")
                 except Exception as e:
                     logger.error(f"Failed to download PDF {pdf_url}: {e}")
                     document.pages_failed += 1
@@ -249,7 +273,7 @@ class CrawlerStage(PipelineStage):
             
             # Check for duplicate
             if self._content_filter.is_duplicate_content(content_hash):
-                logger.debug(f"Duplicate content: {url}")
+                logger.info(f"Duplicate content detected: {url}")
                 return Page(
                     url=url,
                     depth=depth,
@@ -272,54 +296,10 @@ class CrawlerStage(PipelineStage):
             pdf_path = output_dir / f"{filename}.pdf"
             await page_obj.pdf(path=str(pdf_path))
             
-            # --- START VECTOR PIPELINE INTEGRATION ---
-            try:
-                from app.docling.pipeline import get_file_collection, create_vector_pipeline
-                from app.config import UPLOAD_DIR
-                
-                # Use a specific UUID for this page to track it in vector DB
-                file_id = f"{uuid.uuid4()}.pdf"
-                
-                # Also save to the central PDF storage (so Docling processor can find it by file_id)
-                pdf_storage = Path(UPLOAD_DIR)
-                pdf_storage.mkdir(parents=True, exist_ok=True)
-                central_pdf_path = pdf_storage / file_id
-                
-                # Use aiofiles for async file copy
-                async with aiofiles.open(pdf_path, 'rb') as src:
-                    content = await src.read()
-                async with aiofiles.open(central_pdf_path, 'wb') as dst:
-                    await dst.write(content)
-                
-                user_id = "system_crawler"
-                files_collection = await get_file_collection()
-                
-                file_doc = {
-                    "fileId": file_id,
-                    "originalfile": f"{filename}.pdf",
-                    "createdBy": user_id,
-                    "isVectorized": "0",
-                    "isDeleted": False,
-                    "createdAt": datetime.datetime.utcnow(),
-                    "sourceUrl": url
-                }
-                
-                await files_collection.insert_one(file_doc)
-                logger.info(f"Queueing crawled page for vectorization: {url} -> {file_id}")
-                
-                # Trigger pipeline with error handler
-                async def _handle_vector_pipeline():
-                    try:
-                        await create_vector_pipeline(user_id)
-                    except Exception as e:
-                        logger.error(f"Vector pipeline failed for {url}: {e}", exc_info=True)
-                
-                task = asyncio.create_task(_handle_vector_pipeline())
-                # Optional: keep reference to prevent garbage collection
-                task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
-                
-            except Exception as e:
-                logger.error(f"Failed to queue page for vectorization {url}: {e}", exc_info=True)
+            # --- VECTOR PIPELINE DISABLED IN ORCHESTRATOR MODE ---
+            # Note: In orchestrator mode, PDFs are automatically queued for processing
+            # by the PDF processor workers. This legacy integration causes memory exhaustion
+            # and blocks crawlers. Keep this code disabled during orchestration.
             # --- END VECTOR PIPELINE INTEGRATION ---
             
             elapsed = (time.time() - start_time) * 1000
@@ -340,8 +320,8 @@ class CrawlerStage(PipelineStage):
         finally:
             await page_obj.close()
     
-    async def _download_pdf(self, url: str, output_dir: Path) -> Page:
-        """Download a PDF file and save metadata to MongoDB."""
+    async def _download_pdf(self, url: str, output_dir: Path, current_page_url: Optional[str] = None, crawl_depth: int = 0) -> Page:
+        """Download a PDF file and save metadata to MongoDB using nested structure."""
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as response:
                 content = await response.read()
@@ -367,66 +347,55 @@ class CrawlerStage(PipelineStage):
                 async with aiofiles.open(output_path, 'wb') as f:
                     await f.write(content)
                 
-                # 1. Save metadata to MongoDB "files" collection (for Vector Pipeline)
-                try:
-                    from app.docling.pipeline import get_file_collection, create_vector_pipeline
-                    
-                    # Get user ID (defaulting to system if not set)
-                    # Ideally this should come from config or context
-                    user_id = "system_crawler" 
-                    
-                    files_collection = await get_file_collection()
-                    
-                    file_doc = {
-                        "fileId": file_id,
-                        "originalfile": original_filename,
-                        "createdBy": user_id,
-                        "isVectorized": "0",  # Pending
-                        "isDeleted": False,
-                        "createdAt": datetime.datetime.utcnow(),
-                        "sourceUrl": url
-                    }
-                    
-                    await files_collection.insert_one(file_doc)
-                    logger.info(f"Saved PDF metadata to MongoDB 'files' collection: {file_id}")
-                    
-                    # 2. Trigger Vector Pipeline Immediately with error handler
-                    logger.info(f"Triggering vector pipeline for {file_id}...")
-                    
-                    async def _handle_pdf_pipeline():
-                        try:
-                            await create_vector_pipeline(user_id)
-                        except Exception as e:
-                            logger.error(f"Vector pipeline failed for PDF {url}: {e}", exc_info=True)
-                    
-                    task = asyncio.create_task(_handle_pdf_pipeline())
-                    task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
-                    
-                except Exception as e:
-                    logger.error(f"Failed to trigger vector pipeline for {file_id}: {e}", exc_info=True)
+                # --- VECTOR PIPELINE DISABLED IN ORCHESTRATOR MODE ---
+                # Note: PDF processing handled by PDF processor workers in orchestrator mode
+                # Legacy vector pipeline integration disabled to prevent memory exhaustion
+                logger.info(f"PDF downloaded (orchestrator will process): {file_id}")
+                # --- END VECTOR PIPELINE INTEGRATION ---
 
-                # 3. Save metadata to MongoDB "documents" collection (Legacy/Crawler DocumentStore)
+                # Save metadata to MongoDB using nested website structure
                 try:
                     from app.services.document_store import DocumentStore
-                    from app.schemas.document import DocumentStatus
+                    from app.schemas.document import DocumentStatus, PdfDocument
                     store = DocumentStore.from_config()
                     
                     # Get crawl session ID from document metadata or generate one
                     crawl_session_id = getattr(self, '_crawl_session_id', str(uuid.uuid4()))
                     
-                    # Direct PDF downloads are saved with STORED status (not chunked)
-                    store.create_document(
+                    # Extract website URL (scheme + netloc)
+                    website_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                    
+                    # Use the referring page URL if provided, otherwise use the PDF URL itself
+                    visited_url = current_page_url if current_page_url else url
+                    
+                    # Create PdfDocument
+                    pdf_doc = PdfDocument(
+                        file_id=file_id,
                         original_file=original_filename,
                         source_url=url,
                         file_path=str(pdf_path),
                         crawl_session_id=crawl_session_id,
                         file_size=len(content),
-                        crawl_depth=0,
+                        crawl_depth=crawl_depth,
                         status=DocumentStatus.STORED,  # No chunking for direct downloads
+                        is_crawled="1",
+                        total_pages=0,
+                        pages_with_text=0,
+                        pages_needing_ocr=0,
                     )
-                    logger.info(f"Saved PDF to MongoDB 'documents' (STORED): {file_id}")
+                    
+                    # Add PDF to website using nested structure
+                    store.add_pdf_to_website(
+                        website_url=website_url,
+                        crawl_session_id=crawl_session_id,
+                        visited_url=visited_url,
+                        crawl_depth=crawl_depth,
+                        pdf_document=pdf_doc
+                    )
+                    
+                    logger.info(f"Saved PDF to MongoDB 'websites' (nested): {file_id} in {website_url}")
                 except Exception as e:
-                    logger.warning(f"Failed to save PDF to DocumentStore: {e}")
+                    logger.warning(f"Failed to save PDF to DocumentStore: {e}", exc_info=True)
                 
                 return Page(
                     url=url,

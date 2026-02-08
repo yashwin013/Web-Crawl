@@ -292,6 +292,13 @@ Examples:
     batch_parser.add_argument("--workers", type=int, default=4, help="Number of parallel workers (default: 4)")
     batch_parser.add_argument("--docling", action="store_true", help="Use Docling for high-quality PDF processing")
     
+    # Orchestrator command (NEW - Multi-site parallel crawling)
+    orchestrator_parser = subparsers.add_parser("orchestrator", help="Run multi-site parallel crawler")
+    orchestrator_parser.add_argument("urls", nargs="+", help="URLs to crawl (space-separated)")
+    orchestrator_parser.add_argument("--max-pages", type=int, default=50, help="Max pages per site")
+    orchestrator_parser.add_argument("--max-depth", type=int, default=3, help="Max crawl depth")
+    orchestrator_parser.add_argument("--no-monitoring", action="store_true", help="Disable monitoring")
+    
     args = parser.parse_args()
     
     if args.command == "crawl":
@@ -409,6 +416,73 @@ Examples:
             print(f"  ✓ Stored to Qdrant")
         
         print()
+    
+    elif args.command == "orchestrator":
+        from app.orchestrator.coordinator import MultiSiteOrchestrator
+        from app.orchestrator.config import get_default_config
+        from scripts.process_ocr_backlog import process_ocr_backlog
+        from pathlib import Path
+        
+        async def run_orchestrator():
+            config = get_default_config()
+            config.enable_monitoring = not args.no_monitoring
+            
+            orchestrator = MultiSiteOrchestrator(config)
+            
+            try:
+                print(f"\n{'='*70}")
+                print(f"MULTI-SITE PARALLEL CRAWLER")
+                print(f"{'='*70}")
+                print(f"Websites: {len(args.urls)}")
+                for url in args.urls:
+                    print(f"  - {url}")
+                print(f"{'='*70}\n")
+                
+                await orchestrator.startup()
+                await orchestrator.crawl_websites(
+                    args.urls,
+                    max_pages_per_site=args.max_pages,
+                    max_depth=args.max_depth
+                )
+                
+                # Results
+                stats = orchestrator.stats
+                progress = orchestrator.get_progress()
+                
+                print(f"\n{'='*70}")
+                print("CRAWLING RESULTS")
+                print(f"{'='*70}")
+                print(f"Duration: {stats.duration_seconds:.1f}s")
+                print(f"Websites completed: {stats.websites_completed}")
+                print(f"Websites failed: {stats.websites_failed}")
+                
+                if progress:
+                    print(f"Tasks processed: {progress['tasks']['processed']}")
+                    print(f"Tasks failed: {progress['tasks']['failed']}")
+                    if progress['tasks']['processed'] > 0:
+                        print(f"Success rate: {progress['tasks']['success_rate']:.1f}%")
+                
+                print(f"{'='*70}\n")
+                
+            finally:
+                await orchestrator.shutdown()
+            
+            # Phase 2: Process OCR backlog
+            backlog_file = Path("outputs/ocr_backlog/pending_ocr.jsonl")
+            if backlog_file.exists():
+                print(f"\n{'='*70}")
+                print("PHASE 2: OCR BACKLOG PROCESSING")
+                print(f"{'='*70}\n")
+                
+                try:
+                    await process_ocr_backlog()
+                except Exception as e:
+                    print(f"\n❌ OCR processing failed: {e}")
+                    print("You can retry later with: python scripts/process_ocr_backlog.py")
+            else:
+                print("\n✓ No pages require OCR processing")
+        
+        asyncio.run(run_orchestrator())
     
     else:
         parser.print_help()

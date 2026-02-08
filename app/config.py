@@ -74,6 +74,25 @@ OCR_ENABLE_MORPH_CLEANUP = os.getenv("OCR_ENABLE_MORPH_CLEANUP", "false").lower(
 # Default: 300 (increased from 100 to reduce skipped pages)
 OCR_MAX_BBOXES_PER_PAGE = int(os.getenv("OCR_MAX_BBOXES_PER_PAGE", "300"))
 
+# ============== PDF Processing Configuration ==============
+# Skip processing for PDFs larger than this size (in MB) - just download and store
+# Large PDFs can cause memory issues and long processing times
+# Set to 0 to disable this feature (process all PDFs)
+PDF_MAX_PROCESSING_SIZE_MB = float(os.getenv("PDF_MAX_PROCESSING_SIZE_MB", "10.0"))
+# Directory for storing large PDFs that are downloaded but not processed
+LARGE_PDF_STORAGE_DIR = os.getenv("LARGE_PDF_STORAGE_DIR", "data/pdfs/large_files")
+
+# ============== OCR Decision Thresholds (Conservative - Minimize OCR Usage) ==============
+# Only use OCR when absolutely necessary to save processing time
+# Lower word count threshold = less aggressive, fewer PDFs sent to OCR
+OCR_MIN_WORD_COUNT_SUFFICIENT = int(os.getenv("OCR_MIN_WORD_COUNT_SUFFICIENT", "20"))  # Lowered from 50 to 20 - only truly empty PDFs go to OCR
+OCR_SCANNED_PDF_MAX_WORDS = int(os.getenv("OCR_SCANNED_PDF_MAX_WORDS", "10"))  # Lowered from 20 to 10
+# Image thresholds - only OCR large, text-bearing images
+OCR_MIN_TEXT_BEARING_IMAGES = int(os.getenv("OCR_MIN_TEXT_BEARING_IMAGES", "5"))  # Changed from 3 to 5
+OCR_MIN_TEXT_BEARING_RATIO = float(os.getenv("OCR_MIN_TEXT_BEARING_RATIO", "0.7"))  # Changed from 0.5 to 0.7
+OCR_MIN_TEXT_BEARING_AREA = int(os.getenv("OCR_MIN_TEXT_BEARING_AREA", "400000"))  # Changed from 200k to 400k (larger images only)
+OCR_DECORATIVE_MAX_SIZE = int(os.getenv("OCR_DECORATIVE_MAX_SIZE", "500"))  # Changed from 300 to 500 (skip small images)
+
 # ============== Chunking Configuration ==============
 CHUNK_MAX_TOKENS = int(os.getenv("CHUNK_MAX_TOKENS", "512"))
 CHUNK_OVERLAP_TOKENS = int(os.getenv("CHUNK_OVERLAP_TOKENS", "75"))  # 15% overlap (NVIDIA recommended)

@@ -91,11 +91,19 @@ class OCRDecisionStage(PipelineStage):
         ])
         total_images = len(content.images)
         
-        # Thresholds
-        min_text_bearing = config.min_text_bearing_images if config else 3
-        min_text_ratio = config.min_text_bearing_ratio if config else 0.5
-        min_words = config.min_word_count_sufficient if config else 100
-        scanned_max_words = config.scanned_pdf_max_words if config else 50
+        # Import conservative thresholds from config
+        from app.config import (
+            OCR_MIN_WORD_COUNT_SUFFICIENT,
+            OCR_SCANNED_PDF_MAX_WORDS,
+            OCR_MIN_TEXT_BEARING_IMAGES,
+            OCR_MIN_TEXT_BEARING_RATIO,
+        )
+        
+        # Thresholds (use config values for conservative OCR usage)
+        min_text_bearing = OCR_MIN_TEXT_BEARING_IMAGES
+        min_text_ratio = OCR_MIN_TEXT_BEARING_RATIO
+        min_words = OCR_MIN_WORD_COUNT_SUFFICIENT
+        scanned_max_words = OCR_SCANNED_PDF_MAX_WORDS
         
         # Calculate ratios
         text_bearing_ratio = text_bearing_images / total_images if total_images > 0 else 0
@@ -162,8 +170,10 @@ class OCRDecisionStage(PipelineStage):
     
     def _is_text_bearing(self, image: ImageInfo, config) -> bool:
         """Check if image might contain text worth OCRing."""
-        min_area = config.min_text_bearing_area if config else 200000
-        decorative_size = config.decorative_max_size if config else 300
+        from app.config import OCR_MIN_TEXT_BEARING_AREA, OCR_DECORATIVE_MAX_SIZE
+        
+        min_area = OCR_MIN_TEXT_BEARING_AREA
+        decorative_size = OCR_DECORATIVE_MAX_SIZE
         
         # Too small
         if image.width < decorative_size and image.height < decorative_size:
